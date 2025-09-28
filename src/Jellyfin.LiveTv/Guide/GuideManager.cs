@@ -97,14 +97,26 @@ public class GuideManager : IGuideManager
     {
         ArgumentNullException.ThrowIfNull(progress);
 
-        await _recordingsManager.CreateRecordingFolders().ConfigureAwait(false);
+        var totalStopwatch = System.Diagnostics.Stopwatch.StartNew();
+        _logger.LogInformation("Starting RefreshGuide operation");
 
+        var recordingFoldersStart = System.Diagnostics.Stopwatch.StartNew();
+        await _recordingsManager.CreateRecordingFolders().ConfigureAwait(false);
+        recordingFoldersStart.Stop();
+        _logger.LogDebug("Created recording folders in {ElapsedMs}ms", recordingFoldersStart.ElapsedMilliseconds);
+
+        var tunerScanStart = System.Diagnostics.Stopwatch.StartNew();
         await _tunerHostManager.ScanForTunerDeviceChanges(cancellationToken).ConfigureAwait(false);
+        tunerScanStart.Stop();
+        _logger.LogDebug("Scanned for tuner device changes in {ElapsedMs}ms", tunerScanStart.ElapsedMilliseconds);
+
+        var serviceCount = _liveTvManager.Services.Count;
+        _logger.LogInformation("Found {ServiceCount} LiveTV services to process", serviceCount);
 
         var numComplete = 0;
-        double progressPerService = _liveTvManager.Services.Count == 0
+        double progressPerService = serviceCount == 0
             ? 0
-            : 1.0 / _liveTvManager.Services.Count;
+            : 1.0 / serviceCount;
 
         var newChannelIdList = new List<Guid>();
         var newProgramIdList = new List<Guid>();
@@ -115,8 +127,10 @@ public class GuideManager : IGuideManager
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            _logger.LogDebug("Refreshing guide from {Name}", service.Name);
+            _logger.LogInformation("Processing service {ServiceIndex}/{ServiceCount}: {ServiceName}", 
+                numComplete + 1, serviceCount, service.Name);
 
+            var serviceStart = System.Diagnostics.Stopwatch.StartNew();
             try
             {
                 var innerProgress = new Progress<double>(p => progress.Report(p * progressPerService));
@@ -125,6 +139,10 @@ public class GuideManager : IGuideManager
 
                 newChannelIdList.AddRange(idList.Item1);
                 newProgramIdList.AddRange(idList.Item2);
+                
+                serviceStart.Stop();
+                _logger.LogInformation("Completed service {ServiceName} in {ElapsedMs}ms. Added {ChannelCount} channels and {ProgramCount} programs", 
+                    service.Name, serviceStart.ElapsedMilliseconds, idList.Item1.Count, idList.Item2.Count);
             }
             catch (OperationCanceledException)
             {
@@ -132,31 +150,54 @@ public class GuideManager : IGuideManager
             }
             catch (Exception ex)
             {
+                serviceStart.Stop();
                 cleanDatabase = false;
-                _logger.LogError(ex, "Error refreshing channels for service");
+                _logger.LogError(ex, "Error refreshing channels for service {ServiceName} after {ElapsedMs}ms", 
+                    service.Name, serviceStart.ElapsedMilliseconds);
             }
 
             numComplete++;
             double percent = numComplete;
-            percent /= _liveTvManager.Services.Count;
+            percent /= serviceCount;
 
             progress.Report(100 * percent);
         }
 
         if (cleanDatabase)
         {
+            _logger.LogInformation("Starting database cleanup for {ChannelCount} channels and {ProgramCount} programs", 
+                newChannelIdList.Count, newProgramIdList.Count);
+            
+            var cleanupStart = System.Diagnostics.Stopwatch.StartNew();
             CleanDatabase(newChannelIdList.ToArray(), [BaseItemKind.LiveTvChannel], progress, cancellationToken);
             CleanDatabase(newProgramIdList.ToArray(), [BaseItemKind.LiveTvProgram], progress, cancellationToken);
+            cleanupStart.Stop();
+            
+            _logger.LogInformation("Database cleanup completed in {ElapsedMs}ms", cleanupStart.ElapsedMilliseconds);
+        }
+        else
+        {
+            _logger.LogWarning("Skipping database cleanup due to previous errors");
         }
 
         var coreService = _liveTvManager.Services.OfType<DefaultLiveTvService>().FirstOrDefault();
         if (coreService is not null)
         {
+            _logger.LogDebug("Refreshing timers for core service");
+            var timerStart = System.Diagnostics.Stopwatch.StartNew();
+            
             await coreService.RefreshSeriesTimers(cancellationToken).ConfigureAwait(false);
             await coreService.RefreshTimers(cancellationToken).ConfigureAwait(false);
+            
+            timerStart.Stop();
+            _logger.LogDebug("Timer refresh completed in {ElapsedMs}ms", timerStart.ElapsedMilliseconds);
         }
 
         progress.Report(100);
+        totalStopwatch.Stop();
+        
+        _logger.LogInformation("RefreshGuide completed in {TotalElapsedMs}ms. {ServiceCount} services, {TotalChannelCount} channels, {TotalProgramCount} programs", 
+            totalStopwatch.ElapsedMilliseconds, serviceCount, newChannelIdList.Count, newProgramIdList.Count);
     }
 
     private double GetGuideDays()
@@ -170,11 +211,20 @@ public class GuideManager : IGuideManager
 
     private async Task<Tuple<List<Guid>, List<Guid>>> RefreshChannelsInternal(ILiveTvService service, IProgress<double> progress, CancellationToken cancellationToken)
     {
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        _logger.LogInformation("Starting RefreshChannelsInternal for service: {ServiceName}", service.Name);
+        
         progress.Report(10);
 
+        _logger.LogDebug("Getting channels from service: {ServiceName}", service.Name);
+        var channelRetrievalStart = System.Diagnostics.Stopwatch.StartNew();
         var allChannelsList = (await service.GetChannelsAsync(cancellationToken).ConfigureAwait(false))
             .Select(i => new Tuple<string, ChannelInfo>(service.Name, i))
             .ToList();
+        channelRetrievalStart.Stop();
+        
+        _logger.LogInformation("Retrieved {ChannelCount} channels from {ServiceName} in {ElapsedMs}ms", 
+            allChannelsList.Count, service.Name, channelRetrievalStart.ElapsedMilliseconds);
 
         var list = new List<LiveTvChannel>();
         var parentFolder = _liveTvManager.GetInternalLiveTvFolder(cancellationToken);
@@ -184,6 +234,10 @@ public class GuideManager : IGuideManager
         // Use parallel processing only if we have channels to process
         if (allChannelsList.Count > 0)
         {
+            _logger.LogInformation("Processing {ChannelCount} channels in parallel (max {MaxDegree})", 
+                allChannelsList.Count, _channelParallelOptions.MaxDegreeOfParallelism);
+            
+            var channelProcessingStart = System.Diagnostics.Stopwatch.StartNew();
             // Process channels in parallel for better performance
             var channelLock = new object();
 
@@ -196,9 +250,16 @@ public class GuideManager : IGuideManager
                 },
                 async (channelInfo, ct) =>
                 {
+                    var channelStart = System.Diagnostics.Stopwatch.StartNew();
                     try
                     {
+                        _logger.LogDebug("Processing channel: {ChannelName}", channelInfo.Item2.Name);
+                        
                         var item = await GetChannel(channelInfo.Item2, channelInfo.Item1, parentFolder, ct).ConfigureAwait(false);
+                        
+                        channelStart.Stop();
+                        _logger.LogDebug("Channel {ChannelName} processed in {ElapsedMs}ms", 
+                            channelInfo.Item2.Name, channelStart.ElapsedMilliseconds);
 
                         lock (channelLock)
                         {
@@ -214,7 +275,9 @@ public class GuideManager : IGuideManager
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogError(ex, "Error getting channel information for {Name}", channelInfo.Item2.Name);
+                        channelStart.Stop();
+                        _logger.LogError(ex, "Error processing channel {Name} after {ElapsedMs}ms", 
+                            channelInfo.Item2.Name, channelStart.ElapsedMilliseconds);
 
                         lock (channelLock)
                         {
@@ -224,6 +287,15 @@ public class GuideManager : IGuideManager
                         }
                     }
                 }).ConfigureAwait(false);
+            
+            channelProcessingStart.Stop();
+            _logger.LogInformation("Processed {ChannelCount} channels in {ElapsedMs}ms (avg {AvgMs}ms)", 
+                allChannelsList.Count, channelProcessingStart.ElapsedMilliseconds, 
+                channelProcessingStart.ElapsedMilliseconds / Math.Max(1, allChannelsList.Count));
+        }
+        else
+        {
+            _logger.LogInformation("No channels found for service {ServiceName}", service.Name);
         }
 
         progress.Report(15);
@@ -232,7 +304,8 @@ public class GuideManager : IGuideManager
         var channels = new List<Guid>();
         var guideDays = GetGuideDays();
 
-        _logger.LogInformation("Refreshing guide with {Days} days of guide data", guideDays);
+        _logger.LogInformation("Starting program data processing for {ChannelCount} channels ({Days} days)", 
+            list.Count, guideDays);
 
         var maxCacheDate = DateTime.UtcNow.AddDays(MaxCacheDays);
 
@@ -244,6 +317,10 @@ public class GuideManager : IGuideManager
         // Use parallel processing only if we have channels to process
         if (list.Count > 0)
         {
+            _logger.LogInformation("Processing program data for {ChannelCount} channels in parallel", list.Count);
+            
+            var programProcessingStart = System.Diagnostics.Stopwatch.StartNew();
+            
             await Parallel.ForEachAsync(
                 list,
                 new ParallelOptions
@@ -253,6 +330,9 @@ public class GuideManager : IGuideManager
                 },
                 async (currentChannel, ct) =>
                 {
+                    var channelProgramStart = System.Diagnostics.Stopwatch.StartNew();
+                    _logger.LogDebug("Processing programs for channel: {ChannelName}", currentChannel.Name);
+                    
                     lock (channelsLock)
                     {
                         channels.Add(currentChannel.Id);
@@ -269,18 +349,32 @@ public class GuideManager : IGuideManager
                         var isKids = false;
                         var isSeries = false;
 
+                        _logger.LogDebug("Fetching programs for {ChannelName} from {Start} to {End}", 
+                            currentChannel.Name, start, end);
+                        
+                        var programRetrievalStart = System.Diagnostics.Stopwatch.StartNew();
                         var channelPrograms = (await service.GetProgramsAsync(currentChannel.ExternalId, start, end, ct).ConfigureAwait(false)).ToList();
+                        programRetrievalStart.Stop();
+                        
+                        _logger.LogDebug("Retrieved {ProgramCount} programs for {ChannelName} in {ElapsedMs}ms", 
+                            channelPrograms.Count, currentChannel.Name, programRetrievalStart.ElapsedMilliseconds);
 
+                        var dbQueryStart = System.Diagnostics.Stopwatch.StartNew();
                         var existingPrograms = _libraryManager.GetItemList(new InternalItemsQuery
                         {
                             IncludeItemTypes = [BaseItemKind.LiveTvProgram],
                             ChannelIds = [currentChannel.Id],
                             DtoOptions = new DtoOptions(true)
                         }).Cast<LiveTvProgram>().ToDictionary(i => i.Id);
+                        dbQueryStart.Stop();
+                        
+                        _logger.LogDebug("Queried {ExistingCount} existing programs for {ChannelName} in {ElapsedMs}ms", 
+                            existingPrograms.Count, currentChannel.Name, dbQueryStart.ElapsedMilliseconds);
 
                         var newPrograms = new List<LiveTvProgram>();
                         var updatedPrograms = new List<LiveTvProgram>();
 
+                        var programProcessingStart = System.Diagnostics.Stopwatch.StartNew();
                         foreach (var program in channelPrograms)
                         {
                             var (programItem, isNew, isUpdated) = GetProgram(program, existingPrograms, currentChannel);
@@ -304,29 +398,47 @@ public class GuideManager : IGuideManager
                             isNews |= program.IsNews;
                             isKids |= program.IsKids;
                         }
+                        programProcessingStart.Stop();
 
-                        _logger.LogDebug(
-                            "Channel {Name} has {NewCount} new programs and {UpdatedCount} updated programs",
-                            currentChannel.Name,
-                            newPrograms.Count,
-                            updatedPrograms.Count);
+                        _logger.LogDebug("Channel {Name}: {NewCount} new, {UpdatedCount} updated programs ({ElapsedMs}ms)",
+                            currentChannel.Name, newPrograms.Count, updatedPrograms.Count, programProcessingStart.ElapsedMilliseconds);
 
                         if (newPrograms.Count > 0)
                         {
+                            var createStart = System.Diagnostics.Stopwatch.StartNew();
                             _libraryManager.CreateItems(newPrograms, currentChannel, ct);
+                            createStart.Stop();
+                            
+                            _logger.LogDebug("Created {NewProgramCount} programs for {ChannelName} in {ElapsedMs}ms", 
+                                newPrograms.Count, currentChannel.Name, createStart.ElapsedMilliseconds);
 
+                            var cacheStart = System.Diagnostics.Stopwatch.StartNew();
                             await PreCacheImages(newPrograms, maxCacheDate).ConfigureAwait(false);
+                            cacheStart.Stop();
+                            
+                            _logger.LogDebug("Pre-cached {NewProgramCount} new program images for {ChannelName} in {ElapsedMs}ms", 
+                                newPrograms.Count, currentChannel.Name, cacheStart.ElapsedMilliseconds);
                         }
 
                         if (updatedPrograms.Count > 0)
                         {
+                            var updateStart = System.Diagnostics.Stopwatch.StartNew();
                             await _libraryManager.UpdateItemsAsync(
                                 updatedPrograms,
                                 currentChannel,
                                 ItemUpdateType.MetadataImport,
                                 ct).ConfigureAwait(false);
+                            updateStart.Stop();
+                            
+                            _logger.LogDebug("Updated {UpdatedProgramCount} programs for {ChannelName} in {ElapsedMs}ms", 
+                                updatedPrograms.Count, currentChannel.Name, updateStart.ElapsedMilliseconds);
 
+                            var cacheStart = System.Diagnostics.Stopwatch.StartNew();
                             await PreCacheImages(updatedPrograms, maxCacheDate).ConfigureAwait(false);
+                            cacheStart.Stop();
+                            
+                            _logger.LogDebug("Pre-cached {UpdatedProgramCount} updated program images for {ChannelName} in {ElapsedMs}ms", 
+                                updatedPrograms.Count, currentChannel.Name, cacheStart.ElapsedMilliseconds);
                         }
 
                         currentChannel.IsMovie = isMovie;
@@ -339,6 +451,7 @@ public class GuideManager : IGuideManager
                             currentChannel.AddTag("Kids");
                         }
 
+                        var metadataStart = System.Diagnostics.Stopwatch.StartNew();
                         await currentChannel.UpdateToRepositoryAsync(ItemUpdateType.MetadataImport, ct).ConfigureAwait(false);
                         await currentChannel.RefreshMetadata(
                             new MetadataRefreshOptions(new DirectoryService(_fileSystem))
@@ -346,6 +459,11 @@ public class GuideManager : IGuideManager
                                 ForceSave = true
                             },
                             ct).ConfigureAwait(false);
+                        metadataStart.Stop();
+                        
+                        channelProgramStart.Stop();
+                        _logger.LogDebug("Completed {ChannelName} processing in {TotalElapsedMs}ms (metadata: {MetadataMs}ms)", 
+                            currentChannel.Name, channelProgramStart.ElapsedMilliseconds, metadataStart.ElapsedMilliseconds);
                     }
                     catch (OperationCanceledException)
                     {
@@ -353,7 +471,9 @@ public class GuideManager : IGuideManager
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogError(ex, "Error getting programs for channel {Name}", currentChannel.Name);
+                        channelProgramStart.Stop();
+                        _logger.LogError(ex, "Error processing programs for {Name} after {ElapsedMs}ms", 
+                            currentChannel.Name, channelProgramStart.ElapsedMilliseconds);
                     }
 
                     lock (channelsLock)
@@ -363,9 +483,21 @@ public class GuideManager : IGuideManager
                         progress.Report((85 * percent) + 15);
                     }
                 }).ConfigureAwait(false);
+            
+            programProcessingStart.Stop();
+            _logger.LogInformation("Completed program processing for {ChannelCount} channels in {ElapsedMs}ms (avg {AvgMs}ms)", 
+                list.Count, programProcessingStart.ElapsedMilliseconds, programProcessingStart.ElapsedMilliseconds / Math.Max(1, list.Count));
+        }
+        else
+        {
+            _logger.LogInformation("No channels to process for program data");
         }
 
         progress.Report(100);
+        stopwatch.Stop();
+        _logger.LogInformation("RefreshChannelsInternal for {ServiceName} completed in {TotalElapsedMs}ms. {ChannelCount} channels, {ChannelIdCount} channel IDs, {ProgramIdCount} program IDs", 
+            service.Name, stopwatch.ElapsedMilliseconds, allChannelsList.Count, channels.Count, programIds.Count);
+        
         return new Tuple<List<Guid>, List<Guid>>(channels, programIds);
     }
 
