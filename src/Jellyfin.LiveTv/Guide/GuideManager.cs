@@ -179,47 +179,52 @@ public class GuideManager : IGuideManager
         var list = new List<LiveTvChannel>();
         var parentFolder = _liveTvManager.GetInternalLiveTvFolder(cancellationToken);
 
-        // Process channels in parallel for better performance
-        var channelLock = new object();
         var numComplete = 0;
 
-        await Parallel.ForEachAsync(
-            allChannelsList,
-            new ParallelOptions
-            {
-                MaxDegreeOfParallelism = _channelParallelOptions.MaxDegreeOfParallelism,
-                CancellationToken = cancellationToken
-            },
-            async (channelInfo, ct) =>
-            {
-                try
-                {
-                    var item = await GetChannel(channelInfo.Item2, channelInfo.Item1, parentFolder, ct).ConfigureAwait(false);
+        // Use parallel processing only if we have channels to process
+        if (allChannelsList.Count > 0)
+        {
+            // Process channels in parallel for better performance
+            var channelLock = new object();
 
-                    lock (channelLock)
+            await Parallel.ForEachAsync(
+                allChannelsList,
+                new ParallelOptions
+                {
+                    MaxDegreeOfParallelism = _channelParallelOptions.MaxDegreeOfParallelism,
+                    CancellationToken = cancellationToken
+                },
+                async (channelInfo, ct) =>
+                {
+                    try
                     {
-                        list.Add(item);
-                        numComplete++;
-                        double percent = (double)numComplete / allChannelsList.Count;
-                        progress.Report((5 * percent) + 10);
-                    }
-                }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Error getting channel information for {Name}", channelInfo.Item2.Name);
+                        var item = await GetChannel(channelInfo.Item2, channelInfo.Item1, parentFolder, ct).ConfigureAwait(false);
 
-                    lock (channelLock)
-                    {
-                        numComplete++;
-                        double percent = (double)numComplete / allChannelsList.Count;
-                        progress.Report((5 * percent) + 10);
+                        lock (channelLock)
+                        {
+                            list.Add(item);
+                            numComplete++;
+                            double percent = (double)numComplete / allChannelsList.Count;
+                            progress.Report((5 * percent) + 10);
+                        }
                     }
-                }
-            }).ConfigureAwait(false);
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Error getting channel information for {Name}", channelInfo.Item2.Name);
+
+                        lock (channelLock)
+                        {
+                            numComplete++;
+                            double percent = (double)numComplete / allChannelsList.Count;
+                            progress.Report((5 * percent) + 10);
+                        }
+                    }
+                }).ConfigureAwait(false);
+        }
 
         progress.Report(15);
 
@@ -236,125 +241,129 @@ public class GuideManager : IGuideManager
         var channelsLock = new object();
         numComplete = 0;
 
-        await Parallel.ForEachAsync(
-            list,
-            new ParallelOptions
-            {
-                MaxDegreeOfParallelism = _channelParallelOptions.MaxDegreeOfParallelism,
-                CancellationToken = cancellationToken
-            },
-            async (currentChannel, ct) =>
-            {
-                lock (channelsLock)
+        // Use parallel processing only if we have channels to process
+        if (list.Count > 0)
+        {
+            await Parallel.ForEachAsync(
+                list,
+                new ParallelOptions
                 {
-                    channels.Add(currentChannel.Id);
-                }
-
-                try
+                    MaxDegreeOfParallelism = _channelParallelOptions.MaxDegreeOfParallelism,
+                    CancellationToken = cancellationToken
+                },
+                async (currentChannel, ct) =>
                 {
-                    var start = DateTime.UtcNow.AddHours(-1);
-                    var end = start.AddDays(guideDays);
-
-                    var isMovie = false;
-                    var isSports = false;
-                    var isNews = false;
-                    var isKids = false;
-                    var isSeries = false;
-
-                    var channelPrograms = (await service.GetProgramsAsync(currentChannel.ExternalId, start, end, ct).ConfigureAwait(false)).ToList();
-
-                    var existingPrograms = _libraryManager.GetItemList(new InternalItemsQuery
+                    lock (channelsLock)
                     {
-                        IncludeItemTypes = [BaseItemKind.LiveTvProgram],
-                        ChannelIds = [currentChannel.Id],
-                        DtoOptions = new DtoOptions(true)
-                    }).Cast<LiveTvProgram>().ToDictionary(i => i.Id);
-
-                    var newPrograms = new List<LiveTvProgram>();
-                    var updatedPrograms = new List<LiveTvProgram>();
-
-                    foreach (var program in channelPrograms)
-                    {
-                        var (programItem, isNew, isUpdated) = GetProgram(program, existingPrograms, currentChannel);
-                        if (isNew)
-                        {
-                            newPrograms.Add(programItem);
-                        }
-                        else if (isUpdated)
-                        {
-                            updatedPrograms.Add(programItem);
-                        }
-
-                        lock (programLock)
-                        {
-                            programIds.Add(programItem.Id);
-                        }
-
-                        isMovie |= program.IsMovie;
-                        isSeries |= program.IsSeries;
-                        isSports |= program.IsSports;
-                        isNews |= program.IsNews;
-                        isKids |= program.IsKids;
+                        channels.Add(currentChannel.Id);
                     }
 
-                    _logger.LogDebug(
-                        "Channel {Name} has {NewCount} new programs and {UpdatedCount} updated programs",
-                        currentChannel.Name,
-                        newPrograms.Count,
-                        updatedPrograms.Count);
-
-                    if (newPrograms.Count > 0)
+                    try
                     {
-                        _libraryManager.CreateItems(newPrograms, currentChannel, ct);
+                        var start = DateTime.UtcNow.AddHours(-1);
+                        var end = start.AddDays(guideDays);
 
-                        await PreCacheImages(newPrograms, maxCacheDate).ConfigureAwait(false);
-                    }
+                        var isMovie = false;
+                        var isSports = false;
+                        var isNews = false;
+                        var isKids = false;
+                        var isSeries = false;
 
-                    if (updatedPrograms.Count > 0)
-                    {
-                        await _libraryManager.UpdateItemsAsync(
-                            updatedPrograms,
-                            currentChannel,
-                            ItemUpdateType.MetadataImport,
+                        var channelPrograms = (await service.GetProgramsAsync(currentChannel.ExternalId, start, end, ct).ConfigureAwait(false)).ToList();
+
+                        var existingPrograms = _libraryManager.GetItemList(new InternalItemsQuery
+                        {
+                            IncludeItemTypes = [BaseItemKind.LiveTvProgram],
+                            ChannelIds = [currentChannel.Id],
+                            DtoOptions = new DtoOptions(true)
+                        }).Cast<LiveTvProgram>().ToDictionary(i => i.Id);
+
+                        var newPrograms = new List<LiveTvProgram>();
+                        var updatedPrograms = new List<LiveTvProgram>();
+
+                        foreach (var program in channelPrograms)
+                        {
+                            var (programItem, isNew, isUpdated) = GetProgram(program, existingPrograms, currentChannel);
+                            if (isNew)
+                            {
+                                newPrograms.Add(programItem);
+                            }
+                            else if (isUpdated)
+                            {
+                                updatedPrograms.Add(programItem);
+                            }
+
+                            lock (programLock)
+                            {
+                                programIds.Add(programItem.Id);
+                            }
+
+                            isMovie |= program.IsMovie;
+                            isSeries |= program.IsSeries;
+                            isSports |= program.IsSports;
+                            isNews |= program.IsNews;
+                            isKids |= program.IsKids;
+                        }
+
+                        _logger.LogDebug(
+                            "Channel {Name} has {NewCount} new programs and {UpdatedCount} updated programs",
+                            currentChannel.Name,
+                            newPrograms.Count,
+                            updatedPrograms.Count);
+
+                        if (newPrograms.Count > 0)
+                        {
+                            _libraryManager.CreateItems(newPrograms, currentChannel, ct);
+
+                            await PreCacheImages(newPrograms, maxCacheDate).ConfigureAwait(false);
+                        }
+
+                        if (updatedPrograms.Count > 0)
+                        {
+                            await _libraryManager.UpdateItemsAsync(
+                                updatedPrograms,
+                                currentChannel,
+                                ItemUpdateType.MetadataImport,
+                                ct).ConfigureAwait(false);
+
+                            await PreCacheImages(updatedPrograms, maxCacheDate).ConfigureAwait(false);
+                        }
+
+                        currentChannel.IsMovie = isMovie;
+                        currentChannel.IsNews = isNews;
+                        currentChannel.IsSports = isSports;
+                        currentChannel.IsSeries = isSeries;
+
+                        if (isKids)
+                        {
+                            currentChannel.AddTag("Kids");
+                        }
+
+                        await currentChannel.UpdateToRepositoryAsync(ItemUpdateType.MetadataImport, ct).ConfigureAwait(false);
+                        await currentChannel.RefreshMetadata(
+                            new MetadataRefreshOptions(new DirectoryService(_fileSystem))
+                            {
+                                ForceSave = true
+                            },
                             ct).ConfigureAwait(false);
-
-                        await PreCacheImages(updatedPrograms, maxCacheDate).ConfigureAwait(false);
                     }
-
-                    currentChannel.IsMovie = isMovie;
-                    currentChannel.IsNews = isNews;
-                    currentChannel.IsSports = isSports;
-                    currentChannel.IsSeries = isSeries;
-
-                    if (isKids)
+                    catch (OperationCanceledException)
                     {
-                        currentChannel.AddTag("Kids");
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Error getting programs for channel {Name}", currentChannel.Name);
                     }
 
-                    await currentChannel.UpdateToRepositoryAsync(ItemUpdateType.MetadataImport, ct).ConfigureAwait(false);
-                    await currentChannel.RefreshMetadata(
-                        new MetadataRefreshOptions(new DirectoryService(_fileSystem))
-                        {
-                            ForceSave = true
-                        },
-                        ct).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Error getting programs for channel {Name}", currentChannel.Name);
-                }
-
-                lock (channelsLock)
-                {
-                    numComplete++;
-                    double percent = (double)numComplete / allChannelsList.Count;
-                    progress.Report((85 * percent) + 15);
-                }
-            }).ConfigureAwait(false);
+                    lock (channelsLock)
+                    {
+                        numComplete++;
+                        double percent = (double)numComplete / list.Count;
+                        progress.Report((85 * percent) + 15);
+                    }
+                }).ConfigureAwait(false);
+        }
 
         progress.Report(100);
         return new Tuple<List<Guid>, List<Guid>>(channels, programIds);
